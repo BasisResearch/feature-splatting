@@ -422,7 +422,6 @@ class FeatureSplattingModel(SplatfactoModel):
                         similarity_map = similarity_map[:, :, None]
                     
                     outputs["similarity"] = similarity_map
-
         return outputs
 
     def decode_features(self, features_hwc: torch.Tensor, resize_factor: float = 1.) -> Dict[str, torch.Tensor]:
