@@ -57,6 +57,12 @@ class FeatureSplattingModelConfig(SplatfactoModelConfig):
     # Feature Field MLP Head
     mlp_hidden_dim: int = 64
 
+    # Text query parameters for similarity computation - FIXED NAMING
+    positive_text_queries: str = ""
+    negative_text_queries: str = "object"
+    ground_text_queries: str = "floor"
+    softmax_temperature: float = 0.05
+
 def cosine_loss(network_output, gt):
     assert network_output.shape == gt.shape
     return (1 - F.cosine_similarity(network_output, gt, dim=0)).mean()
@@ -86,12 +92,24 @@ class FeatureSplattingModel(SplatfactoModel):
                                          self.kwargs["metadata"]["feature_dim_dict"])
         
         # Visualization utils
-        self.maybe_populate_text_encoder()
+        self.populate_text_encoder()
         self.setup_gui()
 
         self.gaussian_editor = gaussian_editor()
+
+        # FIXED: Set text queries from config if provided - Initialize text embeddings during model setup
+        if self.config.positive_text_queries and self.text_encoding_func is not None:
+            print(f"Setting positive text queries from config: {self.config.positive_text_queries}")
+            print(f"Setting negative text queries from config: {self.config.negative_text_queries}")
+            print(f"Setting ground text queries from config: {self.config.ground_text_queries}")
+            print(f"Setting softmax temperature from config: {self.config.softmax_temperature}")
+            
+            self.viewer_utils.update_text_embedding('positive', self.config.positive_text_queries)
+            self.viewer_utils.update_text_embedding('negative', self.config.negative_text_queries)
+            self.viewer_utils.update_text_embedding('ground', self.config.ground_text_queries)
+            self.viewer_utils.update_softmax_temp(self.config.softmax_temperature)
     
-    def maybe_populate_text_encoder(self):
+    def populate_text_encoder(self):
         if "clip_model_name" in self.kwargs["metadata"]:
             assert "clip" in self.main_feature_name.lower(), "CLIP model name should only be used with CLIP features"
             self.clip_text_encoder = clip_text_encoder(self.kwargs["metadata"]["clip_model_name"], self.kwargs["device"])
@@ -105,27 +123,29 @@ class FeatureSplattingModel(SplatfactoModel):
         self.btn_refresh_pca = ViewerButton("Refresh PCA Projection", cb_hook=lambda _: self.viewer_utils.reset_pca_proj())
         if "clip" in self.main_feature_name.lower():
             self.hint_text = ViewerText(name="Note:", disabled=True, default_value="Use , to separate labels")
+            
+            # FIXED: Use config values as defaults for GUI elements
             self.lang_1_pos_text = ViewerText(
                 name="Positive Text Queries",
-                default_value="",
+                default_value=self.config.positive_text_queries,
                 cb_hook=lambda elem: self.viewer_utils.update_text_embedding('positive', elem.value),
             )
             self.lang_2_neg_text = ViewerText(
                 name="Negative Text Queries",
-                default_value="object",
+                default_value=self.config.negative_text_queries,
                 cb_hook=lambda elem: self.viewer_utils.update_text_embedding('negative', elem.value),
             )
             # call the callback function with the default value
             self.viewer_utils.update_text_embedding('negative', self.lang_2_neg_text.default_value)
             self.lang_ground_text = ViewerText(
                 name="Ground Text Queries",
-                default_value="floor",
+                default_value=self.config.ground_text_queries,
                 cb_hook=lambda elem: self.viewer_utils.update_text_embedding('ground', elem.value),
             )
             self.viewer_utils.update_text_embedding('ground', self.lang_ground_text.default_value)
             self.softmax_temp = ViewerNumber(
                 name="Softmax temperature",
-                default_value=self.viewer_utils.softmax_temp,
+                default_value=self.config.softmax_temperature,  # FIXED: Use config value
                 cb_hook=lambda elem: self.viewer_utils.update_softmax_temp(elem.value),
             )
             # ===== Start Editing utility =====
@@ -356,13 +376,54 @@ class FeatureSplattingModel(SplatfactoModel):
         
         feature = render[:, ..., 3:3 + self.config.feat_latent_dim]
 
-        return {
+        outputs = {
             "rgb": rgb.squeeze(0),  # type: ignore
             "depth": depth_im,  # type: ignore
             "accumulation": alpha.squeeze(0),  # type: ignore
             "background": background,  # type: ignore,
             "feature": feature.squeeze(0),  # type: ignore
         }  # type: ignore
+
+        # FIXED: Add similarity computation during both training and inference when text queries are provided
+        if not self.training or (self.config.positive_text_queries):  # Always compute if queries are provided via config
+            # Add consistent PCA visualization
+            outputs["consistent_latent_pca"], self.viewer_utils.pca_proj, *_ = apply_pca_colormap_return_proj(
+                outputs["feature"], self.viewer_utils.pca_proj
+            )
+            
+            # Add similarity computation for CLIP features
+            if "clip" in self.main_feature_name.lower() and (self.viewer_utils.is_embed_valid('positive') or self.config.positive_text_queries):
+                # Decode features
+                decoded_feature_dict = self.decode_features(outputs["feature"], resize_factor=8)
+                clip_features = decoded_feature_dict[self.main_feature_name]
+                clip_features /= clip_features.norm(dim=0, keepdim=True)
+
+                # Use paired softmax method as described in the paper with positive and negative texts
+                if self.viewer_utils.is_embed_valid('negative'):
+                    neg_embedding = self.viewer_utils.get_text_embed('negative')
+                else:
+                    neg_embedding = self.viewer_utils.get_text_embed('canonical')
+                    
+                if self.viewer_utils.is_embed_valid('positive'):
+                    pos_embedding = self.viewer_utils.get_text_embed('positive')
+                    text_embs = torch.cat([pos_embedding, neg_embedding], dim=0)
+                    raw_sims = torch.einsum("chw,nc->nhw", clip_features, text_embs)
+                    sim_shape_hw = raw_sims.shape[1:]
+
+                    raw_sims = raw_sims.reshape(raw_sims.shape[0], -1)
+                    pos_sim = compute_similarity(raw_sims, self.viewer_utils.softmax_temp, self.viewer_utils.get_embed_shape('positive')[0])
+                    similarity_map = pos_sim.reshape(sim_shape_hw + (1,))  # H, W, 1
+                    
+                    # Upsample heatmap to match size of RGB image
+                    if similarity_map.shape[:2] != outputs["rgb"].shape[:2]:
+                        out_sim = similarity_map[:, :, 0]  # H, W
+                        out_sim = out_sim[None, None, ...]  # 1, 1, H, W
+                        similarity_map = F.interpolate(out_sim, size=outputs["rgb"].shape[:2], mode="bilinear", align_corners=False).squeeze()
+                        similarity_map = similarity_map[:, :, None]
+                    
+                    outputs["similarity"] = similarity_map
+
+        return outputs
 
     def decode_features(self, features_hwc: torch.Tensor, resize_factor: float = 1.) -> Dict[str, torch.Tensor]:
         # Decode features
